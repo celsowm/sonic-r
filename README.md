@@ -25,6 +25,35 @@ If this use of AI is in conflict with your personal beliefs or values, please le
 - **▶ Windows, macOS & Linux** → **[docs/desktop.md](docs/desktop.md)**
 - **▶ Sega Dreamcast** → **[docs/dreamcast.md](docs/dreamcast.md)**
 
+## Exporting character GLBs
+
+`tools/export_sonicr_character.py` converts user-supplied Sonic R PC data into
+a self-contained, rigidly skinned GLB with embedded character atlases and game
+animation clips. It supports all ten characters, not just Sonic. Python 3.12+
+is sufficient; ISO input also needs `7z` available on `PATH`.
+
+```powershell
+python tools/export_sonicr_character.py --iso E:\SONICR.ISO --unpacker E:\tools\Unpacker.exe --character sonic --output exports\sonic.glb
+python tools/export_sonicr_character.py --data-dir D:\Games\SonicR --all --output exports
+python tools/export_sonicr_character.py --data-dir D:\Games\SonicR --character sonic --face-variants --output exports\sonic-face-variants.glb
+```
+
+The exporter never commits or retains extracted game data. Sonic R's
+InstallShield installer cannot be decoded by 7-Zip alone. Pass the optional
+`Unpacker.exe` helper with `--unpacker` (or put it on `PATH`); the exporter
+uses the cabinet's embedded checksums to restore the model, animation and atlas
+file names without running the installer. `--data-dir` remains available for
+an already extracted or installed copy. The standard Sonic export has the 17
+named body clips; `--face-variants` opts into the 68 face-atlas variants for
+viewers that support `KHR_animation_pointer`.
+For normal exports, the tool also embeds a third, generated atlas that bakes
+Sonic R's `GL_ADD_SIGNED` texture combiner with the default `.GRD` lighting
+row. This is necessary because standard glTF can multiply vertex colours but
+cannot express the game's add-signed combiner; the baked/unlit material keeps
+the result stable in Sketchfab. `--vertex-colors` is diagnostic-only. Face
+variant exports retain the original texture-animation path instead of this
+static bake.
+
 Each guide is self-contained: how to get or build it, the game data you supply,
 controls, network play, saves, and troubleshooting for that platform.
 

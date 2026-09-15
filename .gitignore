@@ -20,5 +20,11 @@ windows/*.exe
 SONICR.INF
 update-repo.sh
 
+# Local exports generated from user-supplied Sonic R data
+exports/
+
+# Local InstallShield extraction and preview scratch data
+.tmp-*
+
 # OS / editor cruft
 .DS_Store
