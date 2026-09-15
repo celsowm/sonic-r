@@ -26,5 +26,9 @@ exports/
 # Local InstallShield extraction and preview scratch data
 .tmp-*
 
+# Python bytecode generated while running the exporter/tests
+__pycache__/
+*.py[cod]
+
 # OS / editor cruft
 .DS_Store
