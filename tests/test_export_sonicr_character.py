@@ -43,6 +43,46 @@ class SonicRExporterTests(unittest.TestCase):
         image = EXPORTER.png_rgb(2, 1, bytes((255, 0, 0, 0, 255, 0)))
         self.assertEqual(image[:8], b"\x89PNG\r\n\x1a\n")
 
+    def test_raw_color_key_is_transparent_rgba(self) -> None:
+        raw = bytearray(256 * 256 * 3)
+        raw[0:3] = bytes((0, 255, 0))
+        raw[3:6] = bytes((7, 248, 7))
+        raw[6:9] = bytes((8, 248, 8))
+        rgba = EXPORTER.raw_rgba(bytes(raw))
+        self.assertEqual(rgba[3], 0)
+        self.assertEqual(rgba[7], 0)
+        self.assertEqual(rgba[11], 255)
+        image = EXPORTER.png_rgba(1, 1, bytes((1, 2, 3, 0)))
+        self.assertEqual(image[25], 6)  # PNG color type RGBA
+
+    def test_renderer_model_patches_remap_pages_and_amy_vehicle(self) -> None:
+        vertices = [EXPORTER.Vertex((0, 0, 0), (0, 0, 1), (255, 255, 255, 255))] * 3
+        polygons = [EXPORTER.Polygon(0, [0, 1, 2], [(0, 0)] * 3, 0, i) for i in range(117)]
+        limbs = [EXPORTER.Limb(vertices, polygons)]
+        patched = EXPORTER.apply_renderer_model_patches(EXPORTER.CHARACTER_BY_SLUG["amy"], limbs)
+        self.assertEqual(patched[0].atlas, 0)
+        self.assertEqual(patched[1].atlas, 1)
+        self.assertEqual(patched[34].atlas, 1)
+        self.assertTrue(patched[34].double_sided)
+        self.assertEqual(patched[34].uvs[0], (111.5 / 256.0, 30.5 / 256.0))
+
+    def test_tails_runtime_geometry_has_24_double_sided_quads(self) -> None:
+        vertex = EXPORTER.Vertex((0, 0, 0), (0, 0, 1), (255, 255, 255, 255))
+        limbs = [EXPORTER.Limb([vertex] * 340, [])]
+        patched = EXPORTER.apply_renderer_model_patches(EXPORTER.CHARACTER_BY_SLUG["tails"], limbs)
+        self.assertEqual(len(patched), 24)
+        self.assertTrue(all(p.double_sided and p.corner_refs for p in patched))
+        self.assertEqual(len({ref for p in patched for ref in p.corner_refs or []}), 48)
+
+    def test_baked_tiles_keep_a_gutter_inside_the_cell(self) -> None:
+        vertex = EXPORTER.Vertex((0, 0, 0), (0, 0, 1), (255, 255, 255, 255))
+        limb = EXPORTER.Limb([vertex] * 3, [])
+        polygon = EXPORTER.Polygon(0, [0, 1, 2], [(0.1, 0.1)] * 3, 0, 0)
+        raw = bytes(256 * 256 * 3)
+        png, uv = EXPORTER.bake_add_signed_atlas([limb], [polygon], {}, set(), [raw, raw], [[(128, 128, 128)] * 3], tile_size=8, gutter=2)
+        self.assertEqual(png[25], 6)
+        self.assertEqual(uv[0][0][0], 2.5 / 8.0)
+
     def test_identity_bone_becomes_a_unit_quaternion(self) -> None:
         matrix = EXPORTER.mat_mul(EXPORTER.transpose(EXPORTER.bone_matrix((0, 0, 0))), EXPORTER.BASE_BONE_INVERSE)
         quaternion = EXPORTER.quat_from_matrix(matrix)

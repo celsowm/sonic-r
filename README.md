@@ -53,6 +53,10 @@ cannot express the game's add-signed combiner; the baked/unlit material keeps
 the result stable in Sketchfab. `--vertex-colors` is diagnostic-only. Face
 variant exports retain the original texture-animation path instead of this
 static bake.
+The generated materials preserve the game's RGB5 green color key as masked
+alpha, use nearest sampling with clamped gutters, and reproduce the renderer's
+atlas remaps and double-sided flags. Tails' renderer-generated tail quads are
+included as part of the exported mesh.
 
 Each guide is self-contained: how to get or build it, the game data you supply,
 controls, network play, saves, and troubleshooting for that platform.

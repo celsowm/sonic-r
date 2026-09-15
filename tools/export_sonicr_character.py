@@ -108,6 +108,23 @@ class Polygon:
     uvs: list[tuple[float, float]]
     atlas: int
     ordinal: int
+    # Original model flags (before the loader's flags*2 conversion). Bit 1
+    # marks a genuinely double-sided primitive; bit 0 is the quad winding
+    # exception for which the game submits both halves when either faces the
+    # camera.
+    flags: int = 0
+    # Runtime-generated polygons (the Tails tail) can join vertices from
+    # different limbs. Normal model polygons leave this as None.
+    corner_refs: list[tuple[int, int]] | None = None
+
+    @property
+    def double_sided(self) -> bool:
+        return bool(self.flags & 2) or (len(self.indices) == 4 and bool(self.flags & 1))
+
+    def refs(self) -> list[tuple[int, int]]:
+        if self.corner_refs is not None:
+            return self.corner_refs
+        return [(self.limb, index) for index in self.indices]
 
 
 @dataclass
@@ -355,19 +372,20 @@ def parse_model(path: Path) -> list[Limb]:
         if triangle_count < 0:
             triangle_count = 0
         for _ in range(triangle_count):
-            a, b, c, u0, v0, u1, v1, u2, v2, page, _pad, _flags = take("<HHHBBBBBBBBh")
+            a, b, c, u0, v0, u1, v1, u2, v2, page, _pad, flags = take("<HHHBBBBBBBBh")
             if max(a, b, c) >= vertex_count:
                 die(f"Índice de triângulo inválido em {path}")
             polygons.append(Polygon(limb_index, [c, b, a],
                                     [((u2 + 0.5) / 256.0, (v2 + 0.5) / 256.0),
                                      ((u1 + 0.5) / 256.0, (v1 + 0.5) / 256.0),
-                                     ((u0 + 0.5) / 256.0, (v0 + 0.5) / 256.0)], 1 if page else 0, ordinal))
+                                     ((u0 + 0.5) / 256.0, (v0 + 0.5) / 256.0)],
+                                    1 if page else 0, ordinal, flags))
             ordinal += 1
         quad_count = take("<i")[0]
         if quad_count < 0:
             quad_count = 0
         for _ in range(quad_count):
-            a, b, c, d, u0, v0, u1, v1, u2, v2, u3, v3, page, _pad, _flags = take("<HHHHBBBBBBBBBBh")
+            a, b, c, d, u0, v0, u1, v1, u2, v2, u3, v3, page, _pad, flags = take("<HHHHBBBBBBBBBBh")
             if max(a, b, c, d) >= vertex_count:
                 die(f"Índice de quadrilátero inválido em {path}")
             polygons.append(Polygon(limb_index, [d, c, b, a],
@@ -375,12 +393,83 @@ def parse_model(path: Path) -> list[Limb]:
                                      ((u2 + 0.5) / 256.0, (v2 + 0.5) / 256.0),
                                      ((u1 + 0.5) / 256.0, (v1 + 0.5) / 256.0),
                                      ((u0 + 0.5) / 256.0, (v0 + 0.5) / 256.0)],
-                                    1 if page else 0, ordinal))
+                                    1 if page else 0, ordinal, flags))
             ordinal += 1
         limbs.append(Limb(vertices, polygons))
     if not limbs:
         die(f"Nenhum membro foi encontrado no modelo {path}")
     return limbs
+
+
+# The PC renderer builds Tails' two articulated tails from these vertex rings
+# after drawing the normal model faces. They are not stored as polygons in
+# TAILS_H.BIN, so an exporter that only reads the BIN leaves the segment sides
+# open and produces the gaps visible in external viewers.
+TAIL_SEGMENT_VERTICES = (
+    (175, 176, 178, 179, 177, 174, 187, 181, 180, 193, 195, 188),
+    (184, 185, 197, 192, 191, 194, 208, 207, 210, 209, 206, 205),
+    (303, 304, 306, 308, 307, 305, 319, 318, 325, 322, 312, 311),
+    (320, 321, 326, 314, 315, 323, 334, 338, 339, 337, 336, 335),
+)
+TAIL_FACE_MAP = ((0, 1, 7, 6), (1, 2, 8, 7), (2, 3, 9, 8),
+                 (3, 4, 10, 9), (4, 5, 11, 10), (5, 0, 6, 11))
+
+
+def global_vertex_refs(limbs: list[Limb]) -> dict[int, tuple[int, int]]:
+    refs: dict[int, tuple[int, int]] = {}
+    base = 0
+    for limb_index, limb in enumerate(limbs):
+        for local_index in range(len(limb.vertices)):
+            refs[base + local_index] = (limb_index, local_index)
+        base += len(limb.vertices)
+    return refs
+
+
+def apply_renderer_model_patches(spec: CharacterSpec, limbs: list[Limb]) -> list[Polygon]:
+    """Apply model-load/tpage mutations performed by the original renderer."""
+    polygons = [polygon for limb in limbs for polygon in limb.polygons]
+    for polygon in polygons:
+        logical_page = polygon.atlas
+        # RemapCharacterTpages flips the logical page for all but the first
+        # polygon of Amy, Tails Doll and Super Sonic. These are model-local
+        # ranges because the game stores all ten models contiguously.
+        if spec.char_id == 3 and 113 <= polygon.ordinal <= 116:
+            logical_page = 1  # g_polyTypeTable override before the flip
+        elif spec.char_id == 6 and polygon.ordinal == 0:
+            logical_page = 1  # special Tails Doll first polygon
+        if ((spec.char_id in {3, 6, 9}) and polygon.ordinal > 0):
+            logical_page = 1 - logical_page
+        polygon.atlas = logical_page
+
+        # LoadCharacterModels rewrites Amy's vehicle polygon (global offset
+        # +0x22 from Amy's model start) to the cockpit atlas rectangle and
+        # marks it double-sided. Its face slots are stored D,C,B,A, like BIN
+        # quads, hence the order below.
+        if spec.char_id == 3 and polygon.ordinal == 34:
+            polygon.uvs = [(111.5 / 256.0, 30.5 / 256.0),
+                           (64.5 / 256.0, 30.5 / 256.0),
+                           (64.5 / 256.0, 16.5 / 256.0),
+                           (111.5 / 256.0, 16.5 / 256.0)]
+            polygon.flags |= 2
+
+    if spec.char_id != 1:
+        return polygons
+
+    refs = global_vertex_refs(limbs)
+    next_ordinal = len(polygons)
+    for segment, ring in enumerate(TAIL_SEGMENT_VERTICES):
+        for face in TAIL_FACE_MAP:
+            corner_refs = [refs[ring[index]] for index in face]
+            base_u = 192 if segment % 2 == 0 else 0
+            # Direct tail rendering uses A,B,C,D order (unlike BIN quads,
+            # whose loader stores D,C,B,A).
+            tail_uvs = [(base_u + 0.5, 128.5), (base_u + 7.5, 135.5),
+                        (base_u + 7.5, 128.5), (base_u + 0.5, 135.5)]
+            polygons.append(Polygon(-1, [0, 1, 2, 3],
+                                    [(u / 256.0, v / 256.0) for u, v in tail_uvs],
+                                    0, next_ordinal, 2, corner_refs))
+            next_ordinal += 1
+    return polygons
 
 
 def parse_animation_bank(path: Path) -> list[tuple[int, int, int, int, int, int]]:
@@ -454,6 +543,33 @@ def png_rgb(width: int, height: int, pixels: bytes) -> bytes:
     def chunk(kind: bytes, payload: bytes) -> bytes:
         return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
     return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b"")
+
+
+def png_rgba(width: int, height: int, pixels: bytes) -> bytes:
+    """Encode an RGBA8 PNG without a third-party dependency."""
+    if len(pixels) != width * height * 4:
+        die("Atlas RGBA não tem as dimensões esperadas.")
+    raw = b"".join(b"\0" + pixels[y * width * 4:(y + 1) * width * 4] for y in range(height))
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return (struct.pack(">I", len(payload)) + kind + payload +
+                struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF))
+    return (b"\x89PNG\r\n\x1a\n" +
+            chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)) +
+            chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+
+
+def raw_rgba(raw: bytes) -> bytes:
+    """Convert Sonic R's RGB555 color-keyed atlas to RGBA8."""
+    if len(raw) != 256 * 256 * 3:
+        die("Atlas RAW não tem as dimensões RGB esperadas.")
+    result = bytearray(256 * 256 * 4)
+    for source, target in zip(range(0, len(raw), 3), range(0, len(result), 4)):
+        r, g, b = raw[source:source + 3]
+        # render_gl.c's IS_COLOR_KEY_RGB5: exact after quantization, not only
+        # the literal (0,255,0), so all values in the 5-bit bucket are keyed.
+        alpha = 0 if (r >> 3) == 0 and (g >> 3) == 31 and (b >> 3) == 0 else 255
+        result[target:target + 4] = bytes((r, g, b, alpha))
+    return bytes(result)
 
 
 def mat_mul(a: list[list[float]], b: list[list[float]]) -> list[list[float]]:
@@ -622,7 +738,7 @@ def barycentric(point: tuple[float, float], triangle: list[tuple[float, float]])
 
 def bake_add_signed_atlas(limbs: list[Limb], polygons: list[Polygon], default_faces: dict[int, tuple[int, list[tuple[int, int]]]],
                           face_ids: set[int], raw_textures: list[bytes], lighting: list[list[tuple[int, int, int]]],
-                          tile_size: int = 64) -> tuple[bytes, dict[int, list[tuple[float, float]]]]:
+                          tile_size: int = 64, gutter: int = 2) -> tuple[bytes, dict[int, list[tuple[float, float]]]]:
     """Bake Sonic R's texture + primary-colour - 0.5 combiner into one atlas.
 
     Character rendering uses GL_ADD_SIGNED, not the multiplicative colour
@@ -633,27 +749,43 @@ def bake_add_signed_atlas(limbs: list[Limb], polygons: list[Polygon], default_fa
     tiles_per_side = 1
     while tiles_per_side * tiles_per_side < len(polygons):
         tiles_per_side *= 2
+    if tile_size <= gutter * 2:
+        die("O gutter do atlas precisa deixar uma área interna positiva.")
     atlas_size = tiles_per_side * tile_size
-    pixels = bytearray(atlas_size * atlas_size * 3)
+    inner_size = tile_size - gutter * 2
+    pixels = bytearray(atlas_size * atlas_size * 4)
     result_uvs: dict[int, list[tuple[float, float]]] = {}
 
-    def source_pixel(atlas: int, u: float, v: float) -> tuple[int, int, int]:
+    def source_pixel(atlas: int, u: float, v: float) -> tuple[int, int, int, int]:
         x = min(255, max(0, int(math.floor(u * 256.0))))
         y = min(255, max(0, int(math.floor(v * 256.0))))
         offset = (y * 256 + x) * 3
-        return tuple(raw_textures[atlas][offset:offset + 3])  # type: ignore[return-value]
+        r, g, b = raw_textures[atlas][offset:offset + 3]
+        alpha = 0 if (r >> 3) == 0 and (g >> 3) == 31 and (b >> 3) == 0 else 255
+        return r, g, b, alpha
+
+    def polygon_corner_lights(polygon: Polygon) -> list[tuple[int, int, int]]:
+        return [lighting[limb][index] for limb, index in polygon.refs()]
 
     for tile_index, polygon in enumerate(polygons):
         tile_x = (tile_index % tiles_per_side) * tile_size
         tile_y = (tile_index // tiles_per_side) * tile_size
         local_uvs = default_polygon_uvs(polygon, default_faces, face_ids)
-        local_lights = [lighting[polygon.limb][index] for index in polygon.indices]
-        corners = [(tile_x + 0.5, tile_y + 0.5), (tile_x + tile_size - 0.5, tile_y + 0.5),
-                   (tile_x + tile_size - 0.5, tile_y + tile_size - 0.5), (tile_x + 0.5, tile_y + tile_size - 0.5)]
+        local_lights = polygon_corner_lights(polygon)
+        corners = [(tile_x + gutter + 0.5, tile_y + gutter + 0.5),
+                   (tile_x + tile_size - gutter - 0.5, tile_y + gutter + 0.5),
+                   (tile_x + tile_size - gutter - 0.5, tile_y + tile_size - gutter - 0.5),
+                   (tile_x + gutter + 0.5, tile_y + tile_size - gutter - 0.5)]
         result_uvs[polygon.ordinal] = [(x / atlas_size, y / atlas_size) for x, y in corners[:len(polygon.indices)]]
         for y in range(tile_size):
             for x in range(tile_size):
-                point = ((x + 0.5) / tile_size, (y + 0.5) / tile_size)
+                # Extrude the rendered inner tile into its gutter. This keeps
+                # nearest sampling from crossing into the unrelated polygon
+                # tile next door when a viewer evaluates an edge at float
+                # precision slightly outside the intended texel centre.
+                inner_x = min(inner_size - 1, max(0, x - gutter))
+                inner_y = min(inner_size - 1, max(0, y - gutter))
+                point = ((inner_x + 0.5) / inner_size, (inner_y + 0.5) / inner_size)
                 if len(polygon.indices) == 3:
                     triangle = [0, 1, 2]
                 elif point[1] <= point[0]:
@@ -666,10 +798,11 @@ def bake_add_signed_atlas(limbs: list[Limb], polygons: list[Polygon], default_fa
                 texel = source_pixel(default_faces[polygon.ordinal][0] if polygon.ordinal in face_ids else polygon.atlas, u, v)
                 light = [sum(weights[index] * local_lights[corner][channel] for index, corner in enumerate(triangle))
                          for channel in range(3)]
-                out = (tile_y + y) * atlas_size * 3 + (tile_x + x) * 3
+                out = ((tile_y + y) * atlas_size + tile_x + x) * 4
                 for channel in range(3):
                     pixels[out + channel] = min(255, max(0, int(texel[channel] + light[channel] - 128)))
-    return png_rgb(atlas_size, atlas_size, bytes(pixels)), result_uvs
+                pixels[out + 3] = texel[3]
+    return png_rgba(atlas_size, atlas_size, bytes(pixels)), result_uvs
 
 
 def build_glb(spec: CharacterSpec, data_root: Path, output: Path, fps: float, scale: float,
@@ -681,13 +814,13 @@ def build_glb(spec: CharacterSpec, data_root: Path, output: Path, fps: float, sc
         frames.extend(parse_animation_bank(case_path(object_root, f"{spec.animation_prefix}{index}.BIN")))
     streams = parse_frame_streams(SCRIPT_ROOT / "source" / "sdl" / "src" / "anim_data.c", spec.animation_table)
     face_states = parse_face_states(SCRIPT_ROOT / "source" / "sdl" / "src" / "animation.c", spec.char_id)
-    all_polygons = [polygon for limb in limbs for polygon in limb.polygons]
+    all_polygons = apply_renderer_model_patches(spec, limbs)
     face_ids = {ordinal for state in face_states.values() for ordinal in state}.intersection({poly.ordinal for poly in all_polygons})
     default_faces = face_states[0]
 
     raw_textures = [case_path(data_root, "GENERAL", "PLAYER00.RAW").read_bytes(),
                     case_path(data_root, "GENERAL", "PLAYER01.RAW").read_bytes()]
-    pngs = [png_rgb(256, 256, texture) for texture in raw_textures]
+    pngs = [png_rgba(256, 256, raw_rgba(texture)) for texture in raw_textures]
     baked_uvs: dict[int, list[tuple[float, float]]] = {}
     # Standard GLB material colour is multiplicative, while Sonic R uses
     # GL_ADD_SIGNED. Bake the default face state with the source .GRD row so
@@ -698,6 +831,12 @@ def build_glb(spec: CharacterSpec, data_root: Path, output: Path, fps: float, sc
         baked_texture, baked_uvs = bake_add_signed_atlas(
             limbs, all_polygons, default_faces, face_ids, raw_textures, gouraud_row(limbs, gouraud))
         pngs.append(baked_texture)
+    # Keep both original atlases embedded for inspection/reuse, but do not
+    # create unused glTF texture objects in the normal baked export. The
+    # Khronos validator correctly warns about unused textures even though the
+    # corresponding images are intentionally retained inside the GLB.
+    texture_sources = [2] if baked_texture is not None else [0, 1]
+    texture_indices = {source: index for index, source in enumerate(texture_sources)}
     binary = BinaryBuilder()
     image_views = [binary.view(png) for png in pngs]
     document: dict = {
@@ -709,18 +848,21 @@ def build_glb(spec: CharacterSpec, data_root: Path, output: Path, fps: float, sc
         "images": [{"bufferView": view, "mimeType": "image/png",
                     "name": (f"PLAYER0{index}" if index < 2 else f"{spec.slug}_add_signed")}
                    for index, view in enumerate(image_views)],
-        "samplers": [{"magFilter": 9728, "minFilter": 9728, "wrapS": 10497, "wrapT": 10497}],
-        "textures": [{"source": index, "sampler": 0} for index in range(len(image_views))],
+        "samplers": [{"magFilter": 9728, "minFilter": 9728, "wrapS": 33071, "wrapT": 33071}],
+        "textures": [{"source": source, "sampler": 0} for source in texture_sources],
         "materials": [], "meshes": [], "nodes": [], "skins": [], "animations": [],
         "scenes": [{"nodes": []}], "scene": 0,
     }
 
-    def add_material(name: str, atlas: int, transform: tuple[list[float], list[float]] | None = None) -> int:
-        texinfo: dict = {"index": atlas}
+    def add_material(name: str, atlas: int, transform: tuple[list[float], list[float]] | None = None,
+                     double_sided: bool = False) -> int:
+        texinfo: dict = {"index": texture_indices[atlas]}
         if transform:
             texinfo["extensions"] = {"KHR_texture_transform": {"offset": transform[0], "scale": transform[1]}}
         document["materials"].append({"name": name, "pbrMetallicRoughness": {"baseColorTexture": texinfo,
                                       "metallicFactor": 0.0, "roughnessFactor": 1.0},
+                                      "alphaMode": "MASK", "alphaCutoff": 0.5,
+                                      "doubleSided": double_sided,
                                       "extensions": {"KHR_materials_unlit": {}}})
         return len(document["materials"]) - 1
 
@@ -728,19 +870,28 @@ def build_glb(spec: CharacterSpec, data_root: Path, output: Path, fps: float, sc
     # PLAYER01 is still embedded for face-animation states.  Do not create an
     # unused base material merely to hold that second texture.
     used_body_atlases = {polygon.atlas for polygon in all_polygons}
-    baked_material = add_material(f"{spec.slug}_add_signed", 2) if baked_texture is not None else None
-    base_materials = {} if baked_material is not None else {atlas: add_material(f"PLAYER0{atlas}", atlas)
-                                                             for atlas in sorted(used_body_atlases)}
+    baked_materials = ({side: add_material(f"{spec.slug}_add_signed_{'double' if side else 'cull'}", 2,
+                                           double_sided=side) for side in (False, True)}
+                       if baked_texture is not None else {})
+    base_materials = {} if baked_texture is not None else {
+        (atlas, side): add_material(f"PLAYER0{atlas}_{'double' if side else 'cull'}", atlas,
+                                    double_sided=side)
+        for atlas in sorted(used_body_atlases) for side in (False, True)
+    }
+    polygon_by_ordinal = {polygon.ordinal: polygon for polygon in all_polygons}
     face_materials: dict[int, int] = {}
     if face_variants:
         for face_id in sorted(face_ids):
             atlas, coords = default_faces.get(face_id, (0, [(0, 0), (255, 0), (255, 255), (0, 255)]))
-            face_materials[face_id] = add_material(f"face_{face_id:03d}", atlas, texture_transform(coords))
-    elif baked_material is None:
+            face_materials[face_id] = add_material(
+                f"face_{face_id:03d}", atlas, texture_transform(coords),
+                polygon_by_ordinal[face_id].double_sided)
+    elif baked_texture is None:
         used_face_atlases = {default_faces[face_id][0] for face_id in face_ids if face_id in default_faces}
         for atlas in used_face_atlases:
-            if atlas not in base_materials:
-                base_materials[atlas] = add_material(f"PLAYER0{atlas}", atlas)
+            for side in (False, True):
+                base_materials.setdefault((atlas, side), add_material(
+                    f"PLAYER0{atlas}_{'double' if side else 'cull'}", atlas, double_sided=side))
     if face_materials:
         document["extensionsUsed"].append("KHR_texture_transform")
         if face_variants:
@@ -758,14 +909,14 @@ def build_glb(spec: CharacterSpec, data_root: Path, output: Path, fps: float, sc
     # the same atlas/material as adjacent body polygons.
     groups: dict[tuple[int, int, bool], list[Polygon]] = {}
     for polygon in all_polygons:
-        if baked_material is not None:
-            material = baked_material
+        if baked_texture is not None:
+            material = baked_materials[polygon.double_sided]
         elif polygon.ordinal in face_materials:
             material = face_materials[polygon.ordinal]
         elif polygon.ordinal in default_faces:
-            material = base_materials[default_faces[polygon.ordinal][0]]
+            material = base_materials[(default_faces[polygon.ordinal][0], polygon.double_sided)]
         else:
-            material = base_materials[polygon.atlas]
+            material = base_materials[(polygon.atlas, polygon.double_sided)]
         groups.setdefault((polygon.limb, material, polygon.ordinal in face_ids), []).append(polygon)
     primitives: list[dict] = []
     for (limb_index, material, is_face_primitive), polygons in groups.items():
@@ -779,6 +930,7 @@ def build_glb(spec: CharacterSpec, data_root: Path, output: Path, fps: float, sc
         for polygon in polygons:
             override = default_faces.get(polygon.ordinal)
             is_face = override is not None and polygon.ordinal in face_ids
+            refs = polygon.refs()
             face_uvs: list[tuple[float, float]] | None = None
             if is_face:
                 _, coords = override
@@ -790,8 +942,8 @@ def build_glb(spec: CharacterSpec, data_root: Path, output: Path, fps: float, sc
                 else:
                     face_uvs = default_polygon_uvs(polygon, default_faces, face_ids)
             start = len(positions) // 3
-            for local_index, vertex_index in enumerate(polygon.indices):
-                vertex = limbs[limb_index].vertices[vertex_index]
+            for local_index, (vertex_limb, vertex_index) in enumerate(refs):
+                vertex = limbs[vertex_limb].vertices[vertex_index]
                 p = mat_vec(BASE_BONE_MATRIX, vertex.position)
                 n = unit_vector(mat_vec(BASE_BONE_MATRIX, vertex.normal))
                 positions.extend((p[0] * scale, p[1] * scale, p[2] * scale))
@@ -802,10 +954,10 @@ def build_glb(spec: CharacterSpec, data_root: Path, output: Path, fps: float, sc
                 texcoords.extend(uv)
                 if vertex_colors and not is_face_primitive:
                     colors.extend(vertex.color)
-                joints.extend((limb_index, 0, 0, 0))
+                joints.extend((vertex_limb, 0, 0, 0))
                 weights.extend((1.0, 0.0, 0.0, 0.0))
             indices.extend((start, start + 1, start + 2))
-            if len(polygon.indices) == 4:
+            if len(refs) == 4:
                 indices.extend((start, start + 2, start + 3))
         if len(positions) // 3 > 65535:
             index_payload, index_component = struct.pack("<" + "I" * len(indices), *indices), 5125
